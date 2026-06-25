@@ -1,34 +1,34 @@
 # Project 4 — Multi-Agent Compliance Research Crew
 
-Sistem multi-agent berbasis LangGraph untuk menjawab pertanyaan kompleks seputar
-tarif impor EU. Query seperti *"riset implikasi tarif baru EU untuk produk X dan
-tulis ringkasan eksekutif"* dikerjakan oleh tiga agent spesialis yang
-dikoordinasi satu Supervisor.
+A LangGraph-based multi-agent system for answering complex EU import tariff
+questions. Queries like *"research the implications of new EU tariffs for
+product X and write an executive summary"* are handled by three specialist
+agents coordinated by a single Supervisor.
 
 ---
 
-## Daftar Isi
+## Table of Contents
 
-1. [Arsitektur](#arsitektur)
+1. [Architecture](#architecture)
 2. [Shared State](#shared-state)
 3. [LLM Config](#llm-config)
 4. [Tools](#tools)
-5. [Setiap Agent](#setiap-agent)
+5. [Each Agent](#each-agent)
 6. [Graph & Routing](#graph--routing)
-7. [Alur End-to-End](#alur-end-to-end)
-8. [Cara Menjalankan](#cara-menjalankan)
-9. [Kelemahan Nyata & Trade-off](#kelemahan-nyata--trade-off)
+7. [End-to-End Flow](#end-to-end-flow)
+8. [How to Run](#how-to-run)
+9. [Real Weaknesses & Trade-offs](#real-weaknesses--trade-offs)
 
 ---
 
-## Arsitektur
+## Architecture
 
 ```
 User Query
     |
     v
 +-------------------+
-|    graph.invoke() |  <-- entry point di main.py
+|    graph.invoke() |  <-- entry point in main.py
 +-------------------+
     |
     v
@@ -36,16 +36,15 @@ User Query
 | SUPERVISOR  | ----> Researcher | Analyst | Writer | FINISH
 +-------------+
     ^    |
-    |    +-----------> [Researcher] -> kembali ke Supervisor
-    |    +-----------> [Analyst]    -> kembali ke Supervisor
-    |    +-----------> [Writer]     -> kembali ke Supervisor
+    |    +-----------> [Researcher] -> returns to Supervisor
+    |    +-----------> [Analyst]    -> returns to Supervisor
+    |    +-----------> [Writer]     -> returns to Supervisor
     |
-    +--- FINISH -> END (graph berhenti)
+    +--- FINISH -> END (graph stops)
 ```
 
-Semua node berbagi satu objek `AgentState`. Setiap agent menulis ke
-field-nya masing-masing; Supervisor membaca field-field itu untuk
-memutuskan siapa yang dipanggil berikutnya.
+All nodes share a single `AgentState` object. Each agent writes to its own
+fields; the Supervisor reads those fields to decide who to call next.
 
 ---
 
@@ -56,23 +55,23 @@ memutuskan siapa yang dipanggil berikutnya.
 ```python
 class AgentState(TypedDict):
     messages:          Annotated[Sequence[BaseMessage], operator.add]
-    query:             str   # query asli user, tidak berubah sepanjang workflow
-    research_findings: str   # diisi Researcher
-    analysis_results:  str   # diisi Analyst
-    final_report:      str   # diisi Writer
-    next:              str   # diisi Supervisor: "Researcher"|"Analyst"|"Writer"|"FINISH"
-    iteration_count:   int   # bertambah 1 setiap Supervisor dipanggil
+    query:             str   # original user query, unchanged throughout the workflow
+    research_findings: str   # written by Researcher
+    analysis_results:  str   # written by Analyst
+    final_report:      str   # written by Writer
+    next:              str   # written by Supervisor: "Researcher"|"Analyst"|"Writer"|"FINISH"
+    iteration_count:   int   # incremented by 1 each time Supervisor is called
 ```
 
-### Kenapa `operator.add` untuk `messages`?
+### Why `operator.add` for `messages`?
 
-Field `messages` pakai `Annotated[..., operator.add]` — artinya setiap
-node yang mengembalikan `messages` akan **menambahkan** ke list yang ada,
-bukan menimpa. Ini pola LangGraph v1.x untuk message accumulation.
+The `messages` field uses `Annotated[..., operator.add]` — meaning every node
+that returns `messages` will **append** to the existing list rather than
+overwrite it. This is the LangGraph v1.x pattern for message accumulation.
 
-Field lain (`research_findings`, `analysis_results`, `final_report`) adalah
-string biasa — node yang mengisinya cukup `return {"research_findings": "..."}`,
-dan LangGraph akan menimpa nilai sebelumnya.
+The other fields (`research_findings`, `analysis_results`, `final_report`) are
+plain strings — a node filling them simply does `return {"research_findings": "..."}`,
+and LangGraph overwrites the previous value.
 
 ---
 
@@ -80,69 +79,68 @@ dan LangGraph akan menimpa nilai sebelumnya.
 
 **File:** `p4_multi_agent/llm.py`
 
-Semua agent import LLM dari satu tempat. Kalau mau ganti provider, cukup
-edit file ini — tidak perlu sentuh kode agent sama sekali.
+All agents import their LLM from a single place. To swap providers, edit
+this file only — no agent code needs to change.
 
 ```python
 fast_llm   = ChatOpenAI(model="gpt-4o-mini", temperature=0)    # Supervisor, Researcher, Analyst
 writer_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)  # Writer
 ```
 
-Keduanya mengarah ke endpoint SumoPod (`https://ai.sumopod.com/v1`) yang
-kompatibel dengan OpenAI SDK. API key dibaca dari `.env`:
+Both point to the SumoPod endpoint (`https://ai.sumopod.com/v1`), which is
+compatible with the OpenAI SDK. The API key is read from `.env`:
 
 ```
 SUMOPOD_API_KEY=sk-...
 SUMOPOD_BASE_URL=https://ai.sumopod.com/v1
 ```
 
-`temperature=0` untuk agent yang butuh output deterministik (routing,
-kalkulasi). `temperature=0.3` untuk Writer agar laporan terasa natural,
-bukan robotik.
+`temperature=0` for agents that need deterministic output (routing,
+calculations). `temperature=0.3` for the Writer so the report reads
+naturally rather than robotically.
 
 ---
 
 ## Tools
 
-Tools adalah fungsi Python biasa yang didekorasi `@tool`. LLM tidak
-menjalankannya langsung — LLM meminta tool tertentu dipanggil dengan
-argumen tertentu, lalu LangGraph yang mengeksekusinya dan mengembalikan
-hasilnya ke LLM.
+Tools are plain Python functions decorated with `@tool`. The LLM does not
+execute them directly — it requests a specific tool with specific arguments,
+then LangGraph executes it and returns the result back to the LLM.
 
 ### `search_compliance_docs`
 **File:** `p4_multi_agent/tools/compliance_search.py`
 
-Simulasi RAG (Retrieval-Augmented Generation) dari Project 2. Dalam
-implementasi nyata, ini akan query vector database (ChromaDB/FAISS).
-Di sini menggunakan dict in-memory dengan 5 kategori produk:
+A simulated RAG (Retrieval-Augmented Generation) from Project 2. In a real
+implementation this would query a vector database (ChromaDB/FAISS). Here it
+uses an in-memory dict with 5 product categories:
 
-| Keyword       | HS Code | MFN Rate | EVFTA Rate |
-|---------------|---------|----------|------------|
-| textile       | 5208    | 12.0%    | 9.6%       |
-| electronics   | 8471    | 0.0%     | 0.0%       |
-| footwear      | 6404    | 17.0%    | ~7.5%      |
-| pharmaceutical| 3004    | 0.0%     | 0.0%       |
-| furniture     | 9403    | 2.7%     | 0.0%       |
+| Keyword        | HS Code | MFN Rate | EVFTA Rate |
+|----------------|---------|----------|------------|
+| textile        | 5208    | 12.0%    | 9.6%       |
+| electronics    | 8471    | 0.0%     | 0.0%       |
+| footwear       | 6404    | 17.0%    | ~7.5%      |
+| pharmaceutical | 3004    | 0.0%     | 0.0%       |
+| furniture      | 9403    | 2.7%     | 0.0%       |
 
-Input: query string (nama produk atau HS code).
-Output: JSON string berisi array record yang cocok.
+Input: query string (product name or HS code).
+Output: JSON string containing an array of matching records.
 
-Kalau tidak ada keyword yang match, mengembalikan **semua** record
-sebagai fallback — supaya agent tetap punya data untuk diproses.
+If no keyword matches, it returns **all** records as a fallback so the
+agent still has data to work with.
 
 ---
 
 ### `web_search`
 **File:** `p4_multi_agent/tools/web_search.py`
 
-Wrapper untuk Tavily Search API. Mengembalikan 3 hasil teratas dari web.
+Wrapper for the Tavily Search API. Returns the top 3 results from the web.
 
-Jika `TAVILY_API_KEY` tidak di-set, tool ini mengembalikan **stub
-string** yang berisi data simulasi — sistem tetap berjalan tanpa crash.
+If `TAVILY_API_KEY` is not set, the tool returns a **stub string** with
+simulated data — the system keeps running without crashing.
 
 ```python
 if _tavily is None:
-    return "[WEB SEARCH STUB] ..."  # data simulasi
+    return "[WEB SEARCH STUB] ..."  # simulated data
 ```
 
 ---
@@ -150,8 +148,7 @@ if _tavily is None:
 ### `calculate_tariff_impact`
 **File:** `p4_multi_agent/tools/analysis_tools.py`
 
-Kalkulasi murni Python — tidak ada LLM call di sini. Deterministik dan
-bisa diverifikasi manual.
+Pure Python calculation — no LLM calls. Deterministic and manually verifiable.
 
 ```
 Input:  base_price=5.0, tariff_rate=12.0, volume=10000, currency="EUR"
@@ -171,50 +168,50 @@ Output:
 ### `summarize_research`
 **File:** `p4_multi_agent/tools/analysis_tools.py`
 
-Ekstraksi deterministik — bukan LLM. Memecah teks research menjadi
-kalimat-kalimat, memberi skor berdasarkan kehadiran kata kunci compliance
-(`tariff`, `rate`, `duty`, `regulation`, `certificate`, dll.), lalu
-mengambil N kalimat dengan skor tertinggi sebagai bullet points.
+Deterministic extraction — not an LLM. Splits research text into sentences,
+scores each one by the presence of compliance signal words (`tariff`, `rate`,
+`duty`, `regulation`, `certificate`, etc.), then returns the top N sentences
+as bullet points.
 
 ---
 
-## Setiap Agent
+## Each Agent
 
 ### Supervisor
 **File:** `p4_multi_agent/agents/supervisor.py`
 
 **Model:** `fast_llm` (gpt-4o-mini, temperature=0)
 
-**Tugasnya:** membaca state, memutuskan siapa yang dipanggil berikutnya.
+**Role:** reads state, decides who gets called next.
 
-**Cara kerjanya:**
+**How it works:**
 
-1. Membaca 3 boolean dari state: `has_research`, `has_analysis`, `has_report`
-2. Membangun prompt yang berisi system prompt + status ketiga field itu
-3. Mengirim ke LLM via `.with_structured_output(RouteDecision)`
-4. LLM mengembalikan objek `RouteDecision` dengan field `next` dan `reason`
-5. Mengembalikan `{"next": "...", "iteration_count": iteration + 1}`
+1. Reads 3 booleans from state: `has_research`, `has_analysis`, `has_report`
+2. Builds a prompt containing the system prompt + status of those three fields
+3. Sends it to the LLM via `.with_structured_output(RouteDecision)`
+4. The LLM returns a `RouteDecision` object with `next` and `reason` fields
+5. Returns `{"next": "...", "iteration_count": iteration + 1}`
 
-**Kenapa `with_structured_output`?**
+**Why `with_structured_output`?**
 
-Alternatifnya adalah parsing free-text seperti `if "Researcher" in response`.
-Fragile — kalau model mengembalikan "go to Researcher" alih-alih "Researcher",
-parsing gagal dan supervisor looping. Dengan Pydantic schema, LLM dipaksa
-mengembalikan salah satu dari 4 nilai yang valid (`Literal` type).
+The alternative is free-text parsing like `if "Researcher" in response`.
+That is fragile — if the model returns "go to Researcher" instead of
+"Researcher", parsing fails and the supervisor loops. With a Pydantic schema,
+the LLM is forced to return one of 4 valid values (`Literal` type).
 
-**Routing rules (urutan prioritas):**
+**Routing rules (priority order):**
 ```
-research_findings kosong          -> Researcher
-analysis_results kosong           -> Analyst
-final_report kosong               -> Writer
-final_report ada                  -> FINISH
-iteration_count > 8 & belum FINISH -> Writer (anti-loop emergency)
+research_findings empty            -> Researcher
+analysis_results empty             -> Analyst
+final_report empty                 -> Writer
+final_report present               -> FINISH
+iteration_count > 8 & not FINISHED -> Writer (emergency anti-loop)
 ```
 
-**Apa yang TIDAK dilakukan Supervisor:** Supervisor tidak melihat isi
-`research_findings` atau `analysis_results` — hanya tahu apakah field itu
-kosong atau tidak. Ini trade-off: routing jadi simpel dan murah, tapi
-Supervisor tidak bisa mendeteksi bahwa research-nya buruk.
+**What the Supervisor does NOT do:** it does not read the *contents* of
+`research_findings` or `analysis_results` — it only knows whether those
+fields are empty or not. This is a deliberate trade-off: routing stays
+simple and cheap, but the Supervisor cannot detect that the research was poor.
 
 ---
 
@@ -225,16 +222,16 @@ Supervisor tidak bisa mendeteksi bahwa research-nya buruk.
 **Tools:** `search_compliance_docs`, `web_search`
 **Pattern:** `create_react_agent` (ReAct loop)
 
-**Cara kerjanya:**
+**How it works:**
 
-`create_react_agent` membuat sub-graph ReAct: model berpikir → pilih tool →
-eksekusi tool → lihat hasil → berpikir lagi → sampai model memutuskan selesai.
+`create_react_agent` creates a ReAct sub-graph: model thinks → picks a tool →
+tool executes → sees result → thinks again → until the model decides it is done.
 
 ```
-[Researcher menerima query]
+[Researcher receives query]
     |
     v
-Thought: "Saya perlu cari data tarif tekstil Vietnam"
+Thought: "I need to find tariff data for textiles from Vietnam"
     |
     v
 Action: search_compliance_docs("textile Vietnam tariff")
@@ -243,21 +240,21 @@ Action: search_compliance_docs("textile Vietnam tariff")
 Observation: {"hs_code": "5208", "eu_tariff_rate_pct": 12.0, ...}
     |
     v
-Thought: "Ada data dasar. Perlu cek update terbaru di web"
+Thought: "I have base data. I need to check for recent web updates"
     |
     v
 Action: web_search("EU textile tariff Vietnam 2024 update")
     |
     v
-Observation: "[hasil web / stub]"
+Observation: "[web results / stub]"
     |
     v
 Final Answer: "PRODUCT: Woven fabrics... EU TARIFF RATE: 12.0%..."
 ```
 
-**Output yang ditulis ke state:** `research_findings` (string terformat)
+**Writes to state:** `research_findings` (formatted string)
 
-**Input yang dibaca dari state:** hanya `query`
+**Reads from state:** `query` only
 
 ---
 
@@ -268,16 +265,16 @@ Final Answer: "PRODUCT: Woven fabrics... EU TARIFF RATE: 12.0%..."
 **Tools:** `calculate_tariff_impact`, `summarize_research`
 **Pattern:** `create_react_agent` (ReAct loop)
 
-**Cara kerjanya:**
+**How it works:**
 
-Menerima `research_findings` + `query` dari state (digabung jadi satu
-HumanMessage). ReAct loop berjalan:
+Receives `research_findings` + `query` from state (combined into a single
+HumanMessage). The ReAct loop runs:
 
 ```
-[Analyst menerima research + query]
+[Analyst receives research + query]
     |
     v
-Thought: "Ada tariff_rate 12.0%, base_price 5 EUR, volume 10000"
+Thought: "I see tariff_rate=12.0%, base_price=5 EUR, volume=10000"
     |
     v
 Action: calculate_tariff_impact(base_price=5.0, tariff_rate=12.0, volume=10000)
@@ -295,13 +292,13 @@ Observation: "• EVFTA preferential rate applies with EUR.1 certificate..."
 Final Answer: "FINANCIAL ANALYSIS: ... KEY COMPLIANCE POINTS: ..."
 ```
 
-**Penting:** Prompt Analyst mewajibkan kedua tool dipanggil. Kalau tidak
-ada angka eksplisit di research, Analyst diminta pakai default
-(volume=1000, base_price=10.0) dan mencatatnya.
+**Important:** The Analyst prompt requires both tools to be called. If no
+explicit numbers are in the research, the Analyst uses defaults
+(volume=1000, base_price=10.0) and notes that it did so.
 
-**Output yang ditulis ke state:** `analysis_results`
+**Writes to state:** `analysis_results`
 
-**Input yang dibaca dari state:** `research_findings`, `query`
+**Reads from state:** `research_findings`, `query`
 
 ---
 
@@ -309,36 +306,36 @@ ada angka eksplisit di research, Analyst diminta pakai default
 **File:** `p4_multi_agent/agents/writer.py`
 
 **Model:** `writer_llm` (gpt-4o-mini, temperature=0.3)
-**Tools:** tidak ada
-**Pattern:** direct `llm.invoke()` — bukan ReAct
+**Tools:** none
+**Pattern:** direct `llm.invoke()` — not ReAct
 
-**Kenapa tidak pakai `create_react_agent`?**
+**Why not `create_react_agent`?**
 
-Writer tidak butuh tools — tugasnya murni sintesis teks. Menambahkan
-ReAct overhead (extra LLM call untuk "pilih tool") tidak ada nilainya.
-Direct invoke lebih cepat dan lebih murah.
+The Writer has no tools — its job is pure text synthesis. Adding ReAct
+overhead (an extra LLM call to "pick a tool") provides no value. Direct
+invoke is faster and cheaper.
 
-**Cara kerjanya:**
+**How it works:**
 
-Membangun satu prompt besar yang berisi system prompt + query + research +
-analysis, lalu kirim sekali ke LLM:
+Builds a single large prompt containing the system prompt + query + research +
+analysis, then sends it to the LLM in one call:
 
 ```
-[Writer menerima research + analysis + query]
+[Writer receives research + analysis + query]
     |
     v
-LLM invoke (satu call, tidak ada loop)
+LLM invoke (single call, no loop)
     |
     v
-Output: laporan terstruktur dengan 3 seksi wajib:
-  ## Introduction     <- 2 paragraf konteks
+Output: structured report with 3 required sections:
+  ## Introduction     <- 2 paragraphs of context
   ## Key Findings     <- 5 bullet points
-  ## Recommendation   <- 3-4 action items bernomor
+  ## Recommendation   <- 3-4 numbered action items
 ```
 
-**Output yang ditulis ke state:** `final_report`
+**Writes to state:** `final_report`
 
-**Input yang dibaca dari state:** `research_findings`, `analysis_results`, `query`
+**Reads from state:** `research_findings`, `analysis_results`, `query`
 
 ---
 
@@ -349,16 +346,16 @@ Output: laporan terstruktur dengan 3 seksi wajib:
 ```python
 workflow = StateGraph(AgentState)
 
-# Daftarkan 4 node
+# Register 4 nodes
 workflow.add_node("supervisor", supervisor_node)
 workflow.add_node("Researcher", researcher_node)
 workflow.add_node("Analyst",    analyst_node)
 workflow.add_node("Writer",     writer_node)
 
-# Entry point selalu Supervisor
+# Entry point is always the Supervisor
 workflow.set_entry_point("supervisor")
 
-# Edge bercabang dari Supervisor berdasarkan state["next"]
+# Conditional edges from Supervisor based on state["next"]
 workflow.add_conditional_edges(
     "supervisor",
     lambda state: state["next"],
@@ -366,85 +363,85 @@ workflow.add_conditional_edges(
         "Researcher": "Researcher",
         "Analyst":    "Analyst",
         "Writer":     "Writer",
-        "FINISH":     END,         # graph berhenti
+        "FINISH":     END,         # graph stops
     }
 )
 
-# Semua sub-agent kembali ke Supervisor setelah selesai
+# All sub-agents return to Supervisor after finishing
 workflow.add_edge("Researcher", "supervisor")
 workflow.add_edge("Analyst",    "supervisor")
 workflow.add_edge("Writer",     "supervisor")
 ```
 
 **Recursion limit:** `graph.invoke(state, config={"recursion_limit": 15})`
-LangGraph akan raise `RecursionError` setelah 15 step. Ini safety net
-terakhir — Supervisor punya mekanisme anti-loop sendiri di iteration_count > 8.
+LangGraph raises `RecursionError` after 15 steps. This is the last safety
+net — the Supervisor has its own anti-loop mechanism at `iteration_count > 8`.
 
 ---
 
-## Alur End-to-End
+## End-to-End Flow
 
-Query contoh nyata dari run terakhir:
+Real query from the last run:
 > *"Research EU new tariff implications for electronics products imported
 > from China in 2024, calculate cost impact for 5000 units at 50 EUR base
 > price, and write an executive summary"*
 
 ```
-Step 1: graph.invoke() dipanggil
-        State awal: semua field kosong, iteration_count=0
+Step 1: graph.invoke() is called
+        Initial state: all fields empty, iteration_count=0
 
 Step 2: SUPERVISOR (iter=1)
-        Baca state: has_research=False, has_analysis=False, has_report=False
-        LLM memutuskan: next="Researcher"
+        Reads state: has_research=False, has_analysis=False, has_report=False
+        LLM decides: next="Researcher"
         Reason: "Research findings are empty"
-        State berubah: next="Researcher", iteration_count=1
+        State changes: next="Researcher", iteration_count=1
 
 Step 3: RESEARCHER
         Tool call #1: search_compliance_docs("electronics China tariff")
-          -> dapat record HS 8471: tariff 0.0%, ITA zero-duty
+          -> gets HS 8471 record: tariff 0.0%, ITA zero-duty
         Tool call #2: web_search("EU electronics tariff China 2024")
-          -> dapat stub (Tavily tidak dikonfigurasi)
-        Sintesis -> research_findings terisi
-        State berubah: research_findings="PRODUCT: electronics (HS 8471)..."
+          -> gets stub (Tavily not configured)
+        Synthesises -> research_findings is populated
+        State changes: research_findings="PRODUCT: electronics (HS 8471)..."
 
 Step 4: SUPERVISOR (iter=2)
-        Baca state: has_research=True, has_analysis=False, has_report=False
-        LLM memutuskan: next="Analyst"
+        Reads state: has_research=True, has_analysis=False, has_report=False
+        LLM decides: next="Analyst"
         Reason: "Research complete, need calculations"
-        State berubah: next="Analyst", iteration_count=2
+        State changes: next="Analyst", iteration_count=2
 
 Step 5: ANALYST
-        Baca research_findings dari state
+        Reads research_findings from state
         Tool call #1: calculate_tariff_impact(base_price=50, tariff_rate=0.0, volume=5000)
           -> Total duty: EUR 0.00, Total landed cost: EUR 250,000.00
         Tool call #2: summarize_research(research_findings)
-          -> 5 bullet points compliance
-        Sintesis -> analysis_results terisi
-        State berubah: analysis_results="FINANCIAL ANALYSIS:..."
+          -> 5 compliance bullet points
+        Synthesises -> analysis_results is populated
+        State changes: analysis_results="FINANCIAL ANALYSIS:..."
 
 Step 6: SUPERVISOR (iter=3)
-        Baca state: has_research=True, has_analysis=True, has_report=False
-        LLM memutuskan: next="Writer"
+        Reads state: has_research=True, has_analysis=True, has_report=False
+        LLM decides: next="Writer"
         Reason: "Both research and analysis present, need final report"
-        State berubah: next="Writer", iteration_count=3
+        State changes: next="Writer", iteration_count=3
 
 Step 7: WRITER
-        Baca research_findings + analysis_results + query dari state
-        Satu LLM call -> laporan dengan 3 seksi
-        State berubah: final_report="## Introduction..."
+        Reads research_findings + analysis_results + query from state
+        Single LLM call -> report with 3 sections
+        State changes: final_report="## Introduction..."
 
 Step 8: SUPERVISOR (iter=4)
-        Baca state: has_research=True, has_analysis=True, has_report=True
-        LLM memutuskan: next="FINISH"
-        State berubah: next="FINISH", iteration_count=4
+        Reads state: has_research=True, has_analysis=True, has_report=True
+        LLM decides: next="FINISH"
+        State changes: next="FINISH", iteration_count=4
 
-Step 9: Graph berhenti (FINISH -> END)
-        graph.invoke() mengembalikan state final
+Step 9: Graph stops (FINISH -> END)
+        graph.invoke() returns the final state
 
-Total: 4 iterasi Supervisor, 2 handoff antar agent, wall time ~38 detik
+Total: 4 Supervisor iterations, 2 agent handoffs, wall time ~38 seconds
 ```
 
-### Diagram State Transitions
+### State Transition Diagram
 
 ```
                    [START]
@@ -486,21 +483,21 @@ Total: 4 iterasi Supervisor, 2 handoff antar agent, wall time ~38 detik
 
 ---
 
-## Cara Menjalankan
+## How to Run
 
-### Setup awal (sekali saja)
+### One-time setup
 
 ```powershell
-# 1. Buat file .env
+# 1. Create .env file
 cd A:\Web\agentic-llm
 copy .env.example .env
-# Edit .env, isi SUMOPOD_API_KEY dengan key kamu
+# Edit .env and fill in SUMOPOD_API_KEY with your key
 
-# 2. Pastikan dependencies terinstall
-pip install langgraph langchain langchain-anthropic langchain-community langchain-openai python-dotenv pydantic
+# 2. Install dependencies
+pip install langgraph langchain langchain-community langchain-openai python-dotenv pydantic
 ```
 
-### Jalankan
+### Run
 
 ```powershell
 cd A:\Web\agentic-llm
@@ -508,78 +505,77 @@ $env:PYTHONIOENCODING="utf-8"
 python -m p4_multi_agent.main
 ```
 
-Query custom (tambahkan sebagai argument):
+Custom query (pass as an argument):
 
 ```powershell
-python -m p4_multi_agent.main "riset implikasi tarif EU untuk produk tekstil dari Vietnam, hitung dampak biaya 10000 unit harga EUR 5, tulis ringkasan eksekutif"
+python -m p4_multi_agent.main "research EU tariff implications for textile products from Vietnam, calculate cost impact for 10000 units at EUR 5, write executive summary"
 ```
 
-### Produk yang didukung mock database
+### Products supported by the mock database
 
 `textile`, `electronics`, `footwear`, `pharmaceutical`, `furniture`
 
-Query yang mengandung kata lain akan mengembalikan semua 5 produk sebagai
-fallback.
+Queries containing other keywords return all 5 products as a fallback.
 
 ---
 
-## Kelemahan Nyata & Trade-off
+## Real Weaknesses & Trade-offs
 
-Ini bukan teori dari dokumentasi — ini yang ditemukan saat testing langsung.
+These are not from the docs — these were found during actual testing.
 
-### Kelemahan 1: Latency berlipat ganda
+### Weakness 1: Latency multiplies fast
 
-| Versi        | API Calls | Wall Time |
+| Version      | API Calls | Wall Time |
 |--------------|-----------|-----------|
 | Single-agent | ~3 calls  | ~8-12s    |
 | Multi-agent  | ~9 calls  | ~35-40s   |
 
-Setiap Supervisor call = satu round-trip ke API (~2s). Ditambah ReAct
-loop masing-masing agent (2-3 call per agent). Total 9+ calls untuk
-query yang sebenarnya bisa diselesaikan single-agent dalam 3 calls.
+Every Supervisor call is one API round-trip (~2s). Add the ReAct loop for
+each sub-agent (2-3 calls per agent). Total 9+ calls for a query that a
+single agent could answer in 3 calls.
 
-### Kelemahan 2: State passing yang lossy
+### Weakness 2: State passing is lossy
 
-Supervisor hanya tahu `has_research = True/False` — tidak membaca **isi**
-`research_findings`. Kalau Researcher menghasilkan data yang ambigu atau
-salah, Supervisor tidak tahu. Analyst kemudian meneruskan angka yang
-salah ke Writer, dan Writer dengan percaya diri melaporkannya.
+The Supervisor only knows `has_research = True/False` — it does not read
+the **contents** of `research_findings`. If the Researcher produces
+ambiguous or incorrect data, the Supervisor has no idea. The Analyst then
+forwards those bad numbers to the Writer, who confidently reports them.
 
-Di single-agent, satu model memegang semua konteks — jauh lebih mudah
-mendeteksi inkonsistensi internal.
+In a single-agent setup, one model holds all context simultaneously — it is
+far easier to catch internal inconsistencies.
 
-### Kelemahan 3: Debugging multi-hop susah
+### Weakness 3: Debugging multi-hop failures is painful
 
-Ketika output final salah, pertanyaannya adalah: salah di mana?
-- Research yang buruk?
-- Analyst salah baca angka?
-- Writer salah sintesis?
-- Supervisor salah routing?
+When the final output is wrong, the question is: where did it break?
+- Bad research?
+- Analyst misread the numbers?
+- Writer synthesised incorrectly?
+- Supervisor routed wrong?
 
-Tanpa logging eksplisit di tiap node (seperti `print("[ANALYST] Done...")`)
-atau tool seperti LangSmith, kamu hanya dapat laporan akhir yang salah
-tanpa tahu step mana yang break.
+Without explicit logging at each node (like `print("[ANALYST] Done...")`)
+or a tool like LangSmith, you only receive the wrong final report with no
+indication of which step broke.
 
-Di single-agent: satu chain-of-thought, langsung kelihatan di mana
-reasoningnya keliru.
+In a single-agent setup: one chain-of-thought, immediately visible where
+the reasoning went wrong.
 
 ---
 
-### Kapan Single-Agent Lebih Baik?
+### When is Single-Agent Strictly Better?
 
-| Skenario | Pilihan Terbaik | Alasan |
-|----------|-----------------|--------|
-| Query sederhana ("berapa tarif HS 8471?") | Single-agent | Multi-agent 4x lebih lambat, output sama |
-| Latency penting (chatbot real-time) | Single-agent | 38s tidak acceptable untuk UX |
-| Budget terbatas | Single-agent | Multi-agent 3x lebih banyak token |
-| Sedang development/iterasi prompt | Single-agent | Debug jauh lebih mudah |
-| Query kompleks multi-domain | Multi-agent | Spesialisasi tool tiap agent masuk akal |
-| Scale besar (ratusan query parallel) | Multi-agent | Bisa assign model berbeda per tugas |
+| Scenario | Best Choice | Reason |
+|----------|-------------|--------|
+| Simple query ("what is the tariff for HS 8471?") | Single-agent | Multi-agent is 4x slower for identical output |
+| Latency matters (real-time chatbot) | Single-agent | 38s is not acceptable UX |
+| Tight budget | Single-agent | Multi-agent uses 3x more tokens |
+| Development / prompt iteration phase | Single-agent | Far easier to debug |
+| Complex multi-domain query | Multi-agent | Specialist toolsets per agent make sense |
+| High scale (hundreds of parallel queries) | Multi-agent | Different models can be assigned per task |
 
-**Kesimpulan jujur:** Untuk project ini, single-agent dengan semua 4 tools
-akan menghasilkan output yang setara dengan waktu 3x lebih cepat dan biaya
-2-3x lebih murah. Multi-agent worth it hanya kalau:
-1. Setiap agent perlu model yang berbeda (misal: Researcher pakai model
-   dengan browsing, Writer pakai model dengan fine-tuning laporan)
-2. Agent bisa berjalan paralel (di sini semua sequential)
-3. Tim dev yang berbeda maintain agent yang berbeda
+**Honest conclusion:** For this project, a single-agent with all 4 tools
+would produce equivalent output 3x faster and at 2-3x lower cost.
+Multi-agent is worth it only when:
+1. Each agent genuinely needs a different model (e.g. Researcher needs web
+   browsing, Writer needs a fine-tuned report model)
+2. Agents can run in parallel (here everything is sequential)
+3. Different dev teams maintain different agents
